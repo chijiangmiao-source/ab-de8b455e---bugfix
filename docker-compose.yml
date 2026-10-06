@@ -48,5 +48,16 @@ services:
       - data:/data:ro
     restart: "no"              # one-shot: runs the acceptance suite and exits
 
+  lease-expiry-check:
+    build: .
+    command: ["python", "-m", "verify.lease_expiry"]
+    profiles: ["lease-expiry"]  # opt-in regression; not part of the normal stack
+    environment:
+      DATA_DIR: /data
+      LEASE_TTL_SECONDS: "0"    # the acquired lease is instantly expired
+    volumes:
+      - data:/data
+    restart: "no"              # one-shot: exits non-zero if recovery publishes under an expired lease
+
 volumes:
   data:

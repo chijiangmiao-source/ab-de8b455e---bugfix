@@ -2,8 +2,10 @@
 
 Loop: recover stuck exports (lease expired/absent) -> process one RECEIVED
 export. Processing stages the artifact to a temp file, records and verifies
-its digest, then atomically publishes. Fault-injection hooks (TEST_HOOKS)
-simulate a crash after a partial write or after staging.
+its digest, then atomically publishes. Both processing and recovery
+re-validate the lease (fencing token) before publishing or terminally
+updating an export. Fault-injection hooks (TEST_HOOKS) simulate a crash
+after a partial write or after staging.
 """
 import hashlib
 import os
@@ -20,8 +22,8 @@ def identity():
     return "worker-%s-%d-%s" % (socket.gethostname(), os.getpid(), uuid.uuid4().hex[:6])
 
 
-def lease_resource(export_id):
-    return "export:" + export_id
+# Backwards-compatible alias; the canonical helper lives in store.
+lease_resource = store.lease_resource
 
 
 def _crash(me, export_id, mode):
@@ -92,7 +94,7 @@ def tick(conn, me):
         if fencing is None:
             continue
         try:
-            recovery.recover_export(conn, export_id, me)
+            recovery.recover_export(conn, export_id, me, fencing)
             did_work = True
         finally:
             store.release_lease(conn, lease_resource(export_id), me, fencing)

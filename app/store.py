@@ -294,6 +294,10 @@ def mark_published(conn, export_id, digest, path, actor, via):
 
 # ---------------------------------------------------------------- leases
 
+def lease_resource(export_id):
+    return "export:" + export_id
+
+
 def acquire_lease(conn, resource, owner, ttl_seconds):
     """Take a lease or steal an expired one. Returns the fencing token or None."""
     now = time.time()

@@ -9,6 +9,12 @@ unfinished export, consult the journal/artifact records plus on-disk digests:
   atomic link and the DB update) -> converge the bookkeeping;
 * anything else (partial write, digest mismatch, missing file, orphans) ->
   clean up the残缺 artifacts and requeue the export.
+
+Every publish/terminal update is gated on the caller's lease still being
+valid (fencing token re-checked). An expired lease -- whether it lapsed
+before the recovery round started or in the middle of it -- stops the round
+without publishing or terminally updating anything, so the still-valid
+holder can take over.
 """
 import hashlib
 import os
@@ -22,26 +28,46 @@ def _expected(export_row):
     return data, hashlib.sha256(data).hexdigest()
 
 
-def _converge(conn, export_id, digest, actor, via):
+def _lease_lost(conn, export_id, actor):
     with store.immediate(conn):
+        store.journal(conn, export_id, actor, "lease_lost", "recovery")
+    return "lease_lost"
+
+
+def _converge(conn, export_id, digest, actor, via, fencing):
+    """Terminally mark the export published -- only while the lease is valid."""
+    with store.immediate(conn):
+        if not store.check_lease(conn, store.lease_resource(export_id), actor, fencing):
+            store.journal(conn, export_id, actor, "lease_lost", "recovery")
+            return False
         store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
         store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), actor, via)
+        return True
 
 
-def recover_export(conn, export_id, actor):
-    """Recover one export. Caller must hold the export's lease."""
+def recover_export(conn, export_id, actor, fencing):
+    """Recover one export. Caller must hold the export's lease and pass its
+    fencing token; the lease is re-validated before anything is published or
+    terminally updated."""
     export = store.get_export(conn, export_id)
     if not export or export["stage"] == "PUBLISHED":
         return "none"
+    resource = store.lease_resource(export_id)
+
+    # The lease must be valid before recovery mutates anything at all.
+    if not store.check_lease(conn, resource, actor, fencing):
+        return _lease_lost(conn, export_id, actor)
+
     _, expected_digest = _expected(export)
     pub = artifacts.published_path(export_id)
 
     # Case 1: published file already on disk (crash between link and DB update).
     if os.path.exists(pub):
         if artifacts.sha256_file(pub) == expected_digest:
-            _converge(conn, export_id, expected_digest, actor, "recovery_published_file")
-            artifacts.cleanup_tmp_for(export_id)
-            return "converged"
+            if _converge(conn, export_id, expected_digest, actor, "recovery_published_file", fencing):
+                artifacts.cleanup_tmp_for(export_id)
+                return "converged"
+            return "lease_lost"
         target = artifacts.quarantine(pub)
         with store.immediate(conn):
             store.journal(conn, export_id, actor, "recovery_quarantined_published", target)
@@ -53,10 +79,15 @@ def recover_export(conn, export_id, actor):
             os.path.exists(path)
             and artifacts.sha256_file(path) == row["digest"] == expected_digest
         ):
+            # Re-validate before publishing: the lease may have lapsed while
+            # recovery was verifying the staged bytes.
+            if not store.check_lease(conn, resource, actor, fencing):
+                return _lease_lost(conn, export_id, actor)
             artifacts.publish(path, pub, row["digest"])
-            _converge(conn, export_id, row["digest"], actor, "recovery_staged_artifact")
-            artifacts.cleanup_tmp_for(export_id)
-            return "converged"
+            if _converge(conn, export_id, row["digest"], actor, "recovery_staged_artifact", fencing):
+                artifacts.cleanup_tmp_for(export_id)
+                return "converged"
+            return "lease_lost"
 
     # Case 3: incomplete/mismatched remains -> clean up and requeue.
     removed = artifacts.cleanup_tmp_for(export_id)

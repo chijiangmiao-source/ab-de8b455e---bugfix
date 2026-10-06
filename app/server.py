@@ -187,7 +187,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             payload = _public_export(row)
             payload["events"] = store.export_events(conn, export_id)
-            lease = store.get_lease(conn, "export:" + export_id)
+            lease = store.get_lease(conn, store.lease_resource(export_id))
             payload["lease"] = lease
             payload["download_url"] = "/api/exports/%s/artifact" % export_id
         finally:
