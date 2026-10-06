@@ -70,16 +70,27 @@ def process_export(conn, export_id, me, fencing):
             store.requeue(conn, export_id, me, "digest mismatch after staging")
         return "verify_failed"
 
-    # Fencing: only the valid lease holder may publish.
-    if not store.check_lease(conn, lease_resource(export_id), me, fencing):
+    # Fencing: only the valid lease holder may publish. Revalidate right
+    # before the link, and again atomically inside the terminal transaction:
+    # a lease that expires (or is stolen with a higher fencing token) in
+    # between can neither expose the artifact nor move the stage.
+    resource = lease_resource(export_id)
+    if not store.check_lease(conn, resource, me, fencing):
         with store.immediate(conn):
             store.journal(conn, export_id, me, "lease_lost", None)
         return "lease_lost"
 
-    via = artifacts.publish(tmp, artifacts.published_path(export_id), digest)
-    with store.immediate(conn):
-        store.record_artifact(conn, export_id, "published", artifacts.published_path(export_id), digest)
-        store.mark_published(conn, export_id, digest, artifacts.published_path(export_id), me, via)
+    pub = artifacts.published_path(export_id)
+    via = artifacts.publish(tmp, pub, digest)
+    try:
+        store.mark_published_fenced(conn, resource, me, fencing,
+                                    export_id, digest, pub, me, via)
+    except store.LeaseLostError:
+        # The link may already be on disk; leave it (it is not downloadable
+        # while the stage is not PUBLISHED) for the valid holder to converge.
+        with store.immediate(conn):
+            store.journal(conn, export_id, me, "lease_lost", "after_link")
+        return "lease_lost"
     return "published"
 
 
@@ -92,7 +103,7 @@ def tick(conn, me):
         if fencing is None:
             continue
         try:
-            recovery.recover_export(conn, export_id, me)
+            recovery.recover_export(conn, export_id, me, fencing)
             did_work = True
         finally:
             store.release_lease(conn, lease_resource(export_id), me, fencing)

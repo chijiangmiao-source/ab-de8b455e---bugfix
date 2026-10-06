@@ -17,6 +17,13 @@ from .canonical import canonical, digest_of
 STAGES = ("RECEIVED", "PROCESSING", "STAGED", "PUBLISHED")
 _STAGE_RANK = {stage: rank for rank, stage in enumerate(STAGES)}
 
+
+class LeaseLostError(Exception):
+    """Raised inside a write transaction when the caller's fencing token is no
+    longer valid (expired or superseded). The surrounding IMMEDIATE transaction
+    is rolled back, so a deposed holder cannot leave any terminal state behind.
+    """
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rules (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -292,6 +299,28 @@ def mark_published(conn, export_id, digest, path, actor, via):
     return True
 
 
+def mark_published_fenced(conn, resource, owner, fencing, export_id, digest, path, actor, via):
+    """Terminal transition gated on a valid fencing token.
+
+    Lease revalidation and the stage CAS share one IMMEDIATE transaction: a
+    deposed holder (expired lease, or a higher fencing token after takeover)
+    raises LeaseLostError and the rollback leaves no terminal update behind.
+    Returns False only when the export was already PUBLISHED (never regresses).
+    """
+    with immediate(conn):
+        assert_lease(conn, resource, owner, fencing)
+        if not cas_stage(conn, export_id, "PUBLISHED", ("RECEIVED", "PROCESSING", "STAGED")):
+            journal(conn, export_id, actor, "publish_skipped", "already published")
+            return False
+        record_artifact(conn, export_id, "published", path, digest)
+        conn.execute(
+            "UPDATE exports SET artifact_digest = ?, artifact_path = ?, published_at = ? WHERE export_id = ?",
+            (digest, path, utcnow(), export_id),
+        )
+        journal(conn, export_id, actor, "published", "digest=%s via=%s" % (digest, via))
+        return True
+
+
 # ---------------------------------------------------------------- leases
 
 def acquire_lease(conn, resource, owner, ttl_seconds):
@@ -318,6 +347,20 @@ def check_lease(conn, resource, owner, fencing):
         (resource, owner, fencing, time.time()),
     ).fetchone()
     return row is not None
+
+
+def assert_lease(conn, resource, owner, fencing):
+    """Lease check that must run *inside* the mutating transaction.
+
+    Combined with the stage CAS in the same IMMEDIATE transaction this is
+    atomic: SQLite serializes writers, so a lease cannot be stolen (fencing
+    bumped / expiry reached) between this check and the commit that publishes.
+    Raises LeaseLostError (rolling the transaction back) on failure.
+    """
+    if not check_lease(conn, resource, owner, fencing):
+        raise LeaseLostError(
+            "lease for %s no longer valid (owner=%s fencing=%s)" % (resource, owner, fencing)
+        )
 
 
 def release_lease(conn, resource, owner, fencing):

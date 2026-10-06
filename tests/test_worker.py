@@ -100,6 +100,58 @@ class ProcessTest(WorkerTestBase):
         events = [e["event"] for e in store.export_events(self.conn, "E-1")]
         self.assertIn("published", events)
 
+    def test_tick_recovery_with_zero_ttl_publishes_nothing(self):
+        """Regression (LEASE_TTL_SECONDS=0, fresh volume, durably STAGED export
+        with digest-matching temp artifact): the fencing token is dead on
+        arrival, so a tick must not expose the artifact nor reach PUBLISHED;
+        a later valid holder takes over and converges."""
+        os.environ["LEASE_TTL_SECONDS"] = "0"
+        store.submit_export(self.conn, "E-1", [{"ts": "t0", "lat": 31.2, "depth_m": 10}])
+        row = store.get_export(self.conn, "E-1")
+        data = render_artifact_bytes(row)
+        digest = hashlib.sha256(data).hexdigest()
+        tmp = artifacts.tmp_path("E-1", "deadbeef")
+        artifacts.write_tmp(tmp, data)
+        with store.immediate(self.conn):
+            store.cas_stage(self.conn, "E-1", "PROCESSING", ("RECEIVED",))
+            store.record_artifact(self.conn, "E-1", "staged", tmp, digest)
+            store.cas_stage(self.conn, "E-1", "STAGED", ("PROCESSING",))
+
+        worker.tick(self.conn, "w-stale")
+
+        row = store.get_export(self.conn, "E-1")
+        self.assertEqual("STAGED", row["stage"],
+                         "lease_expired_recovery_stage=%s" % row["stage"])
+        self.assertIsNone(row["published_at"])
+        self.assertFalse(os.path.exists(artifacts.published_path("E-1")))
+        self.assertEqual([], store.published_artifacts(self.conn, "E-1"))
+        # staged evidence preserved for takeover
+        self.assertTrue(os.path.exists(tmp))
+
+        # valid holder (real TTL) takes over on a later tick
+        os.environ["LEASE_TTL_SECONDS"] = "30"
+        worker.tick(self.conn, "w-alive")
+        row = store.get_export(self.conn, "E-1")
+        self.assertEqual("PUBLISHED", row["stage"])
+        self.assertEqual(digest, row["artifact_digest"])
+        self.assertEqual(1, len(store.published_artifacts(self.conn, "E-1")))
+
+    def test_process_export_lease_expiring_midway_publishes_nothing(self):
+        """Normal processing is bound by the same guarantee: a lease that ages
+        out while the artifact is being produced cannot publish."""
+        store.submit_export(self.conn, "E-1", [{"ts": "t0", "lat": 31.2, "depth_m": 10}])
+        fencing = store.acquire_lease(self.conn, worker.lease_resource("E-1"), "w-slow", 0.05)
+        time.sleep(0.07)
+
+        result = worker.process_export(self.conn, "E-1", "w-slow", fencing)
+
+        self.assertEqual("lease_lost", result)
+        row = store.get_export(self.conn, "E-1")
+        self.assertNotEqual("PUBLISHED", row["stage"])
+        self.assertIsNone(row["published_at"])
+        self.assertFalse(os.path.exists(artifacts.published_path("E-1")))
+        self.assertEqual([], store.published_artifacts(self.conn, "E-1"))
+
 
 if __name__ == "__main__":
     unittest.main()

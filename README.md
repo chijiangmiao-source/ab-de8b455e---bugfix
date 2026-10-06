@@ -25,6 +25,10 @@
   首次回执（HTTP 200，`replay: true`），不产生第二个工件；记录或规则快照不同则返回
   HTTP 409 并保留原有证据（原裁决行不被修改，冲突尝试记入日志）。
 - **租约**：worker 必须持有有效租约（带 fencing token）才能处理；发布前复查租约。
+  租约复查与终态 `PUBLISHED` 写入位于**同一个 `IMMEDIATE` 事务**中（fencing
+  原子裁决），因此租约在恢复开始前已失效（含 `LEASE_TTL_SECONDS=0`）或在恢复/发布
+  途中自然到期、被更高 fencing 接管时，旧持有者既不能链接发布工件，也不能推进或回退
+  导出阶段；它直接停止，完整的暂存证据保留给仍有效的持有者后续收敛。
   租约过期后可被其他 worker 接管，fencing 递增使旧持有者失效。
 - **工件管线**：临时文件（fsync）→ 摘要登记 → 重读核验 → `link(2)` 原子发布
   （不可覆盖）→ 事务内标记 `PUBLISHED`。下载接口只投递摘要核验通过的已发布工件。
@@ -54,8 +58,9 @@ docker compose down -v                                   # 重置全部状态
 ## verify 验收内容（执行后退出，退出码即结果）
 
 1. **构建检查**：`python -m compileall app verify tests`
-2. **代码测试**：`python -m unittest discover -s tests`（48 个用例：规范化、遮蔽、
-   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、双 worker 竞态）
+2. **代码测试**：`python -m unittest discover -s tests`（57 个用例：规范化、遮蔽、
+   裁决/幂等/冲突、阶段单调、租约 fencing、恢复收敛/清理、过期租约不得恢复发布、
+   双 worker 竞态）
 3. **API/HTTP 冒烟**：
    - 规则改动后，已冻结导出仍按冻结快照导出（E1 用 R1、E2 用 R2，互不影响）
    - 崩溃恢复：暂存完整后崩溃 → 收敛到同一完整工件；写一半崩溃 → 清理残缺并重处理
